@@ -9,7 +9,8 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -20,14 +21,45 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Tenant Oturumlari Deposu
+// Canlı Log Kayıtları (Son 100 logu hafızada tutar ve /logs endpointinde gösterir)
+const recentLogs = [];
+function addLog(msg) {
+    const time = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+    const line = `[${time}] ${msg}`;
+    console.log(line);
+    recentLogs.unshift(line);
+    if (recentLogs.length > 100) recentLogs.pop();
+}
+
+// Tenant Oturumları Deposu
 // sessions[tenantId] = { sock, qr, qrImage, status, phone }
 const sessions = {};
 
 const logger = pino({ level: 'silent' });
 
 /**
- * Tenant icin WhatsApp Baileys baglantisini baslatir
+ * Mesaj nesnesinden her türlü metni güvenle çıkarır
+ */
+function extractMessageText(msg) {
+    if (!msg || !msg.message) return '';
+    const m = msg.message.ephemeralMessage?.message ||
+              msg.message.viewOnceMessage?.message ||
+              msg.message.viewOnceMessageV2?.message ||
+              msg.message.documentWithCaptionMessage?.message ||
+              msg.message;
+
+    return m.conversation ||
+           m.extendedTextMessage?.text ||
+           m.buttonsResponseMessage?.selectedButtonId ||
+           m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+           m.templateButtonReplyMessage?.selectedId ||
+           m.imageMessage?.caption ||
+           m.videoMessage?.caption ||
+           '';
+}
+
+/**
+ * Tenant için WhatsApp Baileys bağlantısını başlatır
  */
 async function initSession(tenantId) {
     if (sessions[tenantId] && sessions[tenantId].sock) {
@@ -44,11 +76,17 @@ async function initSession(tenantId) {
 
     const sock = makeWASocket({
         version,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
         logger,
         printQRInTerminal: false,
-        browser: ['BerberRandevu Bot', 'Chrome', '1.0.0'],
-        syncFullHistory: false
+        browser: ['BerberRandevu Bot', 'Chrome', '120.0.0.0'],
+        syncFullHistory: false,
+        getMessage: async (key) => {
+            return undefined;
+        }
     });
 
     sessions[tenantId] = {
@@ -59,10 +97,10 @@ async function initSession(tenantId) {
         phone: null
     };
 
-    // Kimlik bilgilerini guncelle
+    // Kimlik bilgilerini güncelle
     sock.ev.on('creds.update', saveCreds);
 
-    // Baglanti durumu degisiklikleri
+    // Bağlantı durumu değişiklikleri
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -72,23 +110,22 @@ async function initSession(tenantId) {
             try {
                 sessions[tenantId].qrImage = await qrcode.toDataURL(qr);
             } catch (err) {
-                console.error(`QR olusturulamadi (Tenant ${tenantId}):`, err.message);
+                addLog(`[Tenant ${tenantId}] QR hatası: ${err.message}`);
             }
-            console.log(`[Tenant ${tenantId}] Yeni Karekod Olusturuldu. Okutulmayi bekliyor...`);
+            addLog(`[Tenant ${tenantId}] Yeni Karekod oluşturuldu. Okutulmayı bekliyor...`);
         }
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.log(`[Tenant ${tenantId}] Baglanti kapandi. Sebep: ${statusCode}. Yeniden baglanilsin mi: ${shouldReconnect}`);
+            addLog(`[Tenant ${tenantId}] Bağlantı kapandı. Sebep: ${statusCode}. Yeniden bağlanılsın mı: ${shouldReconnect}`);
             sessions[tenantId].status = 'disconnected';
             sessions[tenantId].sock = null;
 
             if (shouldReconnect) {
                 setTimeout(() => initSession(tenantId), 3000);
             } else {
-                // Oturum sonlandiysa dosyalari temizle
                 try {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
                 } catch (e) {}
@@ -101,34 +138,33 @@ async function initSession(tenantId) {
             sessions[tenantId].qr = null;
             sessions[tenantId].qrImage = null;
 
-            console.log(`[Tenant ${tenantId}] 🟢 WHATSAPP BAGLANDI! Telefon: +${userPhone}`);
+            addLog(`[Tenant ${tenantId}] 🟢 WHATSAPP BAĞLANDI! Numara: +${userPhone}`);
         }
     });
 
-    // Gelen mesajlari dinle
+    // Gelen mesajları dinle
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
-            if (chatUpdate.type !== 'notify') return;
+            if (!chatUpdate.messages || chatUpdate.messages.length === 0) return;
 
             for (const msg of chatUpdate.messages) {
-                // Kendi attigimiz mesajlari yok say
-                if (msg.key.fromMe) continue;
-
-                // Grup mesajlarini yok say (yalnizca kisisel sohbetler)
                 const remoteJid = msg.key.remoteJid || '';
-                if (!remoteJid.endsWith('@s.whatsapp.net')) continue;
 
-                // Mesaj metnini ayikla
-                const text = msg.message?.conversation ||
-                    msg.message?.extendedTextMessage?.text ||
-                    msg.message?.buttonsResponseMessage?.selectedButtonId ||
-                    msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-                    '';
+                // Grupları ve durum bildirimlerini yoksay
+                if (remoteJid.endsWith('@g.us') || remoteJid.includes('broadcast')) continue;
+
+                const text = extractMessageText(msg);
+
+                // Kendi attığımız mesaj kontrolü
+                if (msg.key.fromMe) {
+                    if (text) addLog(`[Tenant ${tenantId}] (Kendi mesajımız yok sayıldı): "${text.substring(0, 30)}"`);
+                    continue;
+                }
 
                 if (!text || text.trim() === '') continue;
 
-                const fromPhone = remoteJid.replace('@s.whatsapp.net', '');
-                console.log(`[Tenant ${tenantId}] 📩 Gelen Mesaj: ${fromPhone} -> "${text}"`);
+                const fromPhone = remoteJid.split('@')[0];
+                addLog(`[Tenant ${tenantId}] 📩 Gelen Mesaj: ${fromPhone} -> "${text}"`);
 
                 // PHP Webhook'a ilet
                 const webhookUrl = `${WEBHOOK_BASE_URL}?tenant=${tenantId}&provider=baileys`;
@@ -143,16 +179,22 @@ async function initSession(tenantId) {
                     }
                 };
 
-                axios.post(webhookUrl, payload, { timeout: 10000 })
-                    .then(res => {
-                        console.log(`[Tenant ${tenantId}] 🚀 Webhook Yaniti: HTTP ${res.status}`);
-                    })
-                    .catch(err => {
-                        console.error(`[Tenant ${tenantId}] ⚠️ Webhook Hatasi:`, err.message);
-                    });
+                axios.post(webhookUrl, payload, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    },
+                    timeout: 12000
+                })
+                .then(res => {
+                    addLog(`[Tenant ${tenantId}] 🚀 Webhook Yanıtı: HTTP ${res.status}`);
+                })
+                .catch(err => {
+                    addLog(`[Tenant ${tenantId}] ⚠️ Webhook Hatası: ${err.message}`);
+                });
             }
         } catch (e) {
-            console.error(`[Tenant ${tenantId}] Mesaj isleme hatasi:`, e.message);
+            addLog(`[Tenant ${tenantId}] Mesaj işleme hatası: ${e.message}`);
         }
     });
 
@@ -163,7 +205,7 @@ async function initSession(tenantId) {
 // API ENDPOINTLARI
 // ========================================================
 
-// 1. Ana Durum Sayfasi
+// 1. Ana Durum Sayfası
 app.get('/', (req, res) => {
     res.json({
         service: 'BerberRandevu WhatsApp Gateway (Baileys)',
@@ -173,7 +215,61 @@ app.get('/', (req, res) => {
     });
 });
 
-// 2. Canli Durum Sorgulama
+// 2. Canlı Loglar (Hata tespiti için)
+app.get('/logs', (req, res) => {
+    res.json({
+        success: true,
+        count: recentLogs.length,
+        logs: recentLogs
+    });
+});
+
+// 3. Webhook Test Endpointi (Render -> PHP sunucu bağlantısını test eder)
+app.get('/test-webhook', async (req, res) => {
+    const tenantId = req.query.tenant || '5';
+    const testPhone = req.query.phone || '905542822751';
+    const webhookUrl = `${WEBHOOK_BASE_URL}?tenant=${tenantId}&provider=baileys`;
+
+    addLog(`[Test] Webhook test isteği gönderiliyor: ${webhookUrl}`);
+
+    try {
+        const payload = {
+            event_type: 'message_received',
+            provider: 'baileys',
+            tenant_id: tenantId,
+            data: {
+                from: testPhone,
+                body: '1',
+                fromMe: false
+            }
+        };
+
+        const response = await axios.post(webhookUrl, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 12000
+        });
+
+        addLog(`[Test] Webhook başarılı: HTTP ${response.status}`);
+        res.json({
+            success: true,
+            status: response.status,
+            data: response.data
+        });
+    } catch (err) {
+        addLog(`[Test] Webhook BAŞARISIZ: ${err.message}`);
+        res.status(500).json({
+            success: false,
+            error: err.message,
+            response: err.response?.data || null,
+            status: err.response?.status || null
+        });
+    }
+});
+
+// 4. Canlı Durum Sorgulama
 app.get('/status', async (req, res) => {
     const tenantId = req.query.tenant || '5';
     let sess = sessions[tenantId];
@@ -191,7 +287,7 @@ app.get('/status', async (req, res) => {
     });
 });
 
-// 3. QR Kod Getir (Resim / Data URL)
+// 5. QR Kod Getir (Resim / Data URL)
 app.get('/qr', async (req, res) => {
     const tenantId = req.query.tenant || '5';
     let sess = sessions[tenantId];
@@ -209,7 +305,6 @@ app.get('/qr', async (req, res) => {
         });
     }
 
-    // QR kod uretilene kadar maksimum 3 saniye bekle
     let attempts = 0;
     while (!sess.qrImage && attempts < 15) {
         await new Promise(r => setTimeout(r, 200));
@@ -217,7 +312,6 @@ app.get('/qr', async (req, res) => {
     }
 
     if (sess.qrImage) {
-        // format query kontrolu (raw image mi data url mi)
         if (req.query.format === 'img') {
             const base64Data = sess.qrImage.replace(/^data:image\/png;base64,/, '');
             const imgBuffer = Buffer.from(base64Data, 'base64');
@@ -242,7 +336,7 @@ app.get('/qr', async (req, res) => {
     });
 });
 
-// 4. Mesaj Gonder (Outbound)
+// 6. Mesaj Gönder (Outbound)
 app.post('/send', async (req, res) => {
     try {
         const tenantId = req.body.tenant || req.query.tenant || '5';
@@ -258,7 +352,6 @@ app.post('/send', async (req, res) => {
             return res.status(503).json({ success: false, error: 'Bu dukkanin WhatsApp oturumu bagli degil' });
         }
 
-        // Telefonu temizle
         let cleanPhone = to.toString().replace(/[^0-9]/g, '');
         if (cleanPhone.startsWith('0')) {
             cleanPhone = '90' + cleanPhone.substring(1);
@@ -269,15 +362,15 @@ app.post('/send', async (req, res) => {
         const jid = `${cleanPhone}@s.whatsapp.net`;
         await sess.sock.sendMessage(jid, { text: message });
 
-        console.log(`[Tenant ${tenantId}] 📤 Giden Mesaj: ${cleanPhone} -> "${message.substring(0, 40)}..."`);
+        addLog(`[Tenant ${tenantId}] 📤 Giden Mesaj: ${cleanPhone} -> "${message.substring(0, 35)}..."`);
         res.json({ success: true, to: cleanPhone, status: 'sent' });
     } catch (err) {
-        console.error('Mesaj gonderme hatasi:', err);
+        addLog(`[Tenant ${tenantId}] ⚠️ Mesaj gönderme hatası: ${err.message}`);
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// 5. Cikis Yap / Baglantiyi Kes
+// 7. Çıkış Yap / Bağlantıyı Kes
 app.post('/disconnect', async (req, res) => {
     try {
         const tenantId = req.body.tenant || req.query.tenant || '5';
@@ -293,22 +386,20 @@ app.post('/disconnect', async (req, res) => {
         }
 
         delete sessions[tenantId];
+        addLog(`[Tenant ${tenantId}] 🔴 Oturum kapatıldı ve temizlendi`);
         res.json({ success: true, message: 'Oturum kapatildi ve veriler temizlendi' });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// Sunucuyu Baslat
+// Sunucuyu Başlat
 app.listen(PORT, () => {
-    console.log(`=======================================================`);
-    console.log(`🚀 BerberRandevu Baileys WhatsApp Gateway Calisiyor!`);
-    console.log(`🌐 Port: ${PORT}`);
-    console.log(`📡 Webhook Hedefi: ${WEBHOOK_BASE_URL}`);
-    console.log(`=======================================================`);
+    addLog(`🚀 BerberRandevu Baileys WhatsApp Gateway Port ${PORT} üzerinde hazır!`);
+    addLog(`📡 Webhook Hedefi: ${WEBHOOK_BASE_URL}`);
 
-    // Varsayilan olarak tenant 5'i otomatik baslat
+    // Otomatik tenant 5 başlat
     initSession('5').catch(err => {
-        console.error('Tenant 5 baslatma hatasi:', err.message);
+        addLog(`Tenant 5 baslatma hatasi: ${err.message}`);
     });
 });
