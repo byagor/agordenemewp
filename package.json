@@ -1,0 +1,17 @@
+{
+  "name": "berber-whatsapp-gateway",
+  "version": "1.0.0",
+  "description": "BerberRandevu Acik Kaynakli Ucretsiz WhatsApp Web Gateway (Baileys tabanli)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}
