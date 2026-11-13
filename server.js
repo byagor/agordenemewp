@@ -10,7 +10,8 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore
+    makeCacheableSignalKeyStore,
+    Browsers
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -31,6 +32,26 @@ function addLog(msg) {
     console.log(line);
     recentLogs.unshift(line);
     if (recentLogs.length > 100) recentLogs.pop();
+}
+
+// Mesaj Tekrar Deneme Sayacı Önbelleği (WhatsApp'ın "Mesaj bekleniyor..." hatasını çözer)
+const retryMap = new Map();
+const msgRetryCounterCache = {
+    get: (key) => retryMap.get(key),
+    set: (key, value) => { retryMap.set(key, value); return true; },
+    del: (key) => retryMap.delete(key),
+    flushAll: () => retryMap.clear()
+};
+
+// Son gönderilen ve alınan mesajları hafızada tutan depo (WhatsApp retry/rekey istediğinde sunar)
+const messageStore = new Map();
+function storeMessage(key, message) {
+    if (!key || !key.id) return;
+    messageStore.set(key.id, message);
+    if (messageStore.size > 2000) {
+        const firstKey = messageStore.keys().next().value;
+        messageStore.delete(firstKey);
+    }
 }
 
 // Tenant Oturumları Deposu
@@ -174,10 +195,16 @@ async function initSession(tenantId) {
         },
         logger,
         printQRInTerminal: false,
-        browser: ['BerberRandevu Bot', 'Chrome', '120.0.0.0'],
+        browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
+        msgRetryCounterCache,
         getMessage: async (key) => {
-            return undefined;
+            if (messageStore.has(key.id)) {
+                return messageStore.get(key.id);
+            }
+            return {
+                conversation: 'BerberRandevu Bot'
+            };
         }
     });
 
@@ -245,6 +272,10 @@ async function initSession(tenantId) {
             if (!chatUpdate.messages || chatUpdate.messages.length === 0) return;
 
             for (const msg of chatUpdate.messages) {
+                if (msg.key && msg.message) {
+                    storeMessage(msg.key, msg.message);
+                }
+
                 const remoteJid = msg.key.remoteJid || '';
 
                 // Grupları ve durum bildirimlerini yoksay
@@ -258,9 +289,13 @@ async function initSession(tenantId) {
                     continue;
                 }
 
-                if (!text || text.trim() === '') continue;
-
                 const fromPhone = remoteJid.split('@')[0];
+
+                if (!text || text.trim() === '') {
+                    addLog(`[Tenant ${tenantId}] ℹ️ Metinsiz/Şifreleme aşamasında sinyal: ${fromPhone} (Stub: ${msg.messageStubType || 'yok'})`);
+                    continue;
+                }
+
                 addLog(`[Tenant ${tenantId}] 📩 Gelen Mesaj: ${fromPhone} -> "${text}"`);
 
                 // PHP Webhook'a ilet
@@ -457,7 +492,10 @@ app.post('/send', async (req, res) => {
         }
 
         const jid = `${cleanPhone}@s.whatsapp.net`;
-        await sess.sock.sendMessage(jid, { text: message });
+        const sent = await sess.sock.sendMessage(jid, { text: message });
+        if (sent?.key && sent?.message) {
+            storeMessage(sent.key, sent.message);
+        }
 
         addLog(`[Tenant ${tenantId}] 📤 Giden Mesaj: ${cleanPhone} -> "${message.substring(0, 35)}..."`);
         res.json({ success: true, to: cleanPhone, status: 'sent' });
