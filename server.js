@@ -11,7 +11,8 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-    Browsers
+    Browsers,
+    proto
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -195,8 +196,13 @@ async function initSession(tenantId) {
         },
         logger,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
-        syncFullHistory: false,
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: true,
+        shouldSyncHistoryMessage: (msg) => {
+            return msg.syncType === proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP ||
+                   msg.syncType === proto.HistorySync.HistorySyncType.PUSH_NAME ||
+                   msg.syncType === proto.HistorySync.HistorySyncType.RECENT;
+        },
         msgRetryCounterCache,
         getMessage: async (key) => {
             if (messageStore.has(key.id)) {
