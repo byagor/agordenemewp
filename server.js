@@ -16,6 +16,8 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3100;
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || 'https://agorsoftware.com/berber/api/webhook.php';
+const DB_SYNC_URL = process.env.DB_SYNC_URL || 'https://agorsoftware.com/berber/api/wa_session.php';
+const DB_SYNC_TOKEN = 'wa_gateway_secret_2026';
 
 app.use(cors());
 app.use(express.json());
@@ -59,6 +61,89 @@ function extractMessageText(msg) {
 }
 
 /**
+ * MySQL Veritabanından oturum dosyalarını indirip yerel klasöre yazar
+ */
+async function restoreSessionFromDb(tenantId, sessionDir) {
+    try {
+        const url = `${DB_SYNC_URL}?action=load&tenant=${tenantId}&token=${DB_SYNC_TOKEN}`;
+        const res = await axios.get(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BaileysGateway/1.0' },
+            timeout: 10000
+        });
+
+        if (res.data && res.data.success && res.data.files && Object.keys(res.data.files).length > 0) {
+            if (!fs.existsSync(sessionDir)) {
+                fs.mkdirSync(sessionDir, { recursive: true });
+            }
+            let written = 0;
+            for (const [fileName, content] of Object.entries(res.data.files)) {
+                fs.writeFileSync(path.join(sessionDir, fileName), content, 'utf-8');
+                written++;
+            }
+            addLog(`[Tenant ${tenantId}] 📥 MySQL Veritabanından ${written} oturum dosyası geri yüklendi!`);
+            return true;
+        }
+    } catch (e) {
+        addLog(`[Tenant ${tenantId}] ⚠️ Veritabanından oturum yüklenemedi: ${e.message}`);
+    }
+    return false;
+}
+
+/**
+ * Yerel oturum dosyalarını MySQL veritabanına otomatik yedekler (Debounced)
+ */
+const backupTimeouts = {};
+function scheduleBackupToDb(tenantId, sessionDir, delayMs = 4000) {
+    if (backupTimeouts[tenantId]) {
+        clearTimeout(backupTimeouts[tenantId]);
+    }
+    backupTimeouts[tenantId] = setTimeout(async () => {
+        try {
+            if (!fs.existsSync(sessionDir)) return;
+            const fileNames = fs.readdirSync(sessionDir);
+            if (fileNames.length === 0) return;
+
+            const filesObj = {};
+            for (const f of fileNames) {
+                const fullPath = path.join(sessionDir, f);
+                const stat = fs.statSync(fullPath);
+                if (stat.isFile()) {
+                    filesObj[f] = fs.readFileSync(fullPath, 'utf-8');
+                }
+            }
+
+            const url = `${DB_SYNC_URL}?action=save&tenant=${tenantId}&token=${DB_SYNC_TOKEN}`;
+            await axios.post(url, { files: filesObj }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BaileysGateway/1.0'
+                },
+                timeout: 15000
+            });
+            addLog(`[Tenant ${tenantId}] 💾 Oturum MySQL veritabanına yedeklendi (${Object.keys(filesObj).length} dosya)`);
+        } catch (e) {
+            addLog(`[Tenant ${tenantId}] ⚠️ MySQL yedekleme hatası: ${e.message}`);
+        }
+    }, delayMs);
+}
+
+/**
+ * Veritabanındaki oturum kaydını temizler
+ */
+async function deleteSessionFromDb(tenantId) {
+    try {
+        const url = `${DB_SYNC_URL}?action=delete&tenant=${tenantId}&token=${DB_SYNC_TOKEN}`;
+        await axios.get(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BaileysGateway/1.0' },
+            timeout: 10000
+        });
+        addLog(`[Tenant ${tenantId}] 🗑️ Oturum MySQL veritabanından silindi`);
+    } catch (e) {
+        addLog(`[Tenant ${tenantId}] ⚠️ MySQL oturum silme hatası: ${e.message}`);
+    }
+}
+
+/**
  * Tenant için WhatsApp Baileys bağlantısını başlatır
  */
 async function initSession(tenantId) {
@@ -69,6 +154,13 @@ async function initSession(tenantId) {
     const sessionDir = path.join(__dirname, 'sessions', `tenant_${tenantId}`);
     if (!fs.existsSync(sessionDir)) {
         fs.mkdirSync(sessionDir, { recursive: true });
+    }
+
+    // Yerel diskte creds.json yoksa, MySQL veritabanından geri yükle
+    const credsPath = path.join(sessionDir, 'creds.json');
+    if (!fs.existsSync(credsPath)) {
+        addLog(`[Tenant ${tenantId}] Yerel oturum bulunamadı, MySQL veritabanından aranıyor...`);
+        await restoreSessionFromDb(tenantId, sessionDir);
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -97,8 +189,11 @@ async function initSession(tenantId) {
         phone: null
     };
 
-    // Kimlik bilgilerini güncelle
-    sock.ev.on('creds.update', saveCreds);
+    // Kimlik bilgilerini güncelle ve veritabanına yedekle
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        scheduleBackupToDb(tenantId, sessionDir, 4000);
+    });
 
     // Bağlantı durumu değişiklikleri
     sock.ev.on('connection.update', async (update) => {
@@ -129,6 +224,7 @@ async function initSession(tenantId) {
                 try {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
                 } catch (e) {}
+                await deleteSessionFromDb(tenantId);
                 delete sessions[tenantId];
             }
         } else if (connection === 'open') {
@@ -139,6 +235,7 @@ async function initSession(tenantId) {
             sessions[tenantId].qrImage = null;
 
             addLog(`[Tenant ${tenantId}] 🟢 WHATSAPP BAĞLANDI! Numara: +${userPhone}`);
+            scheduleBackupToDb(tenantId, sessionDir, 1000);
         }
     });
 
@@ -385,6 +482,7 @@ app.post('/disconnect', async (req, res) => {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
 
+        await deleteSessionFromDb(tenantId);
         delete sessions[tenantId];
         addLog(`[Tenant ${tenantId}] 🔴 Oturum kapatıldı ve temizlendi`);
         res.json({ success: true, message: 'Oturum kapatildi ve veriler temizlendi' });
@@ -402,4 +500,19 @@ app.listen(PORT, () => {
     initSession('5').catch(err => {
         addLog(`Tenant 5 baslatma hatasi: ${err.message}`);
     });
+
+    // 5 Dakikalık Canlılık (Keep-Alive) Döngüsü
+    // Render Free sunucusunun uyku moduna geçmesini önlemek için her 5 dakikada bir PHP cron'a ping atar
+    setInterval(async () => {
+        try {
+            const keepAliveUrl = 'https://agorsoftware.com/berber/api/cron_keepalive.php?token=berber_cron_2026';
+            await axios.get(keepAliveUrl, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BaileysGateway/1.0' },
+                timeout: 8000
+            });
+            addLog(`[KeepAlive] 💓 5 dakikalık canlılık kontrolü tamamlandı.`);
+        } catch (e) {
+            addLog(`[KeepAlive] ⚠️ Ping notu: ${e.message}`);
+        }
+    }, 5 * 60 * 1000);
 });
