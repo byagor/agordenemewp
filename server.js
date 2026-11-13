@@ -266,67 +266,95 @@ async function initSession(tenantId) {
         }
     });
 
+    // Mesaj işleme fonksiyonu (upsert ve update için ortak)
+    async function handleIncomingMessage(msg) {
+        if (!msg || !msg.key) return;
+
+        if (msg.message) {
+            storeMessage(msg.key, msg.message);
+        }
+
+        const remoteJid = msg.key.remoteJid || '';
+
+        // Grupları ve durum bildirimlerini yoksay
+        if (remoteJid.endsWith('@g.us') || remoteJid.includes('broadcast')) return;
+
+        const text = extractMessageText(msg);
+
+        // Kendi attığımız mesaj kontrolü
+        if (msg.key.fromMe) {
+            if (text) addLog(`[Tenant ${tenantId}] (Kendi mesajımız yok sayıldı): "${text.substring(0, 30)}"`);
+            return;
+        }
+
+        const isLid = remoteJid.endsWith('@lid');
+        const senderPnRaw = msg.key.senderPn || msg.key.participantPn || '';
+        const realPhone = senderPnRaw ? senderPnRaw.split('@')[0] : (isLid ? remoteJid : remoteJid.split('@')[0]);
+
+        if (!text || text.trim() === '') {
+            const stubParams = msg.messageStubParameters ? JSON.stringify(msg.messageStubParameters) : '';
+            addLog(`[Tenant ${tenantId}] ℹ️ Metinsiz/Stub: ${realPhone} (Stub: ${msg.messageStubType || 'yok'}${stubParams ? ' - ' + stubParams : ''})`);
+            return;
+        }
+
+        addLog(`[Tenant ${tenantId}] 📩 Gelen Mesaj: ${realPhone} -> "${text}"`);
+
+        // Yeni oturum / ratchet anahtarlarını veritabanına yedekle (debounce 5 sn)
+        scheduleBackupToDb(tenantId, sessionDir, 5000);
+
+        // PHP Webhook'a ilet
+        const webhookUrl = `${WEBHOOK_BASE_URL}?tenant=${tenantId}&provider=baileys`;
+        const payload = {
+            event_type: 'message_received',
+            provider: 'baileys',
+            tenant_id: tenantId,
+            data: {
+                from: realPhone,
+                jid: remoteJid,
+                body: text.trim(),
+                fromMe: false
+            }
+        };
+
+        axios.post(webhookUrl, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 12000
+        })
+        .then(res => {
+            addLog(`[Tenant ${tenantId}] 🚀 Webhook Yanıtı: HTTP ${res.status}`);
+        })
+        .catch(err => {
+            addLog(`[Tenant ${tenantId}] ⚠️ Webhook Hatası: ${err.message}`);
+        });
+    }
+
     // Gelen mesajları dinle
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             if (!chatUpdate.messages || chatUpdate.messages.length === 0) return;
-
             for (const msg of chatUpdate.messages) {
-                if (msg.key && msg.message) {
-                    storeMessage(msg.key, msg.message);
-                }
-
-                const remoteJid = msg.key.remoteJid || '';
-
-                // Grupları ve durum bildirimlerini yoksay
-                if (remoteJid.endsWith('@g.us') || remoteJid.includes('broadcast')) continue;
-
-                const text = extractMessageText(msg);
-
-                // Kendi attığımız mesaj kontrolü
-                if (msg.key.fromMe) {
-                    if (text) addLog(`[Tenant ${tenantId}] (Kendi mesajımız yok sayıldı): "${text.substring(0, 30)}"`);
-                    continue;
-                }
-
-                const fromPhone = remoteJid.split('@')[0];
-
-                if (!text || text.trim() === '') {
-                    addLog(`[Tenant ${tenantId}] ℹ️ Metinsiz/Şifreleme aşamasında sinyal: ${fromPhone} (Stub: ${msg.messageStubType || 'yok'})`);
-                    continue;
-                }
-
-                addLog(`[Tenant ${tenantId}] 📩 Gelen Mesaj: ${fromPhone} -> "${text}"`);
-
-                // PHP Webhook'a ilet
-                const webhookUrl = `${WEBHOOK_BASE_URL}?tenant=${tenantId}&provider=baileys`;
-                const payload = {
-                    event_type: 'message_received',
-                    provider: 'baileys',
-                    tenant_id: tenantId,
-                    data: {
-                        from: fromPhone,
-                        body: text.trim(),
-                        fromMe: false
-                    }
-                };
-
-                axios.post(webhookUrl, payload, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    },
-                    timeout: 12000
-                })
-                .then(res => {
-                    addLog(`[Tenant ${tenantId}] 🚀 Webhook Yanıtı: HTTP ${res.status}`);
-                })
-                .catch(err => {
-                    addLog(`[Tenant ${tenantId}] ⚠️ Webhook Hatası: ${err.message}`);
-                });
+                await handleIncomingMessage(msg);
             }
         } catch (e) {
             addLog(`[Tenant ${tenantId}] Mesaj işleme hatası: ${e.message}`);
+        }
+    });
+
+    // Yeniden deneme (retry) sonrası gecikmeli çözülen mesajları dinle
+    sock.ev.on('messages.update', async (messageUpdates) => {
+        try {
+            if (!messageUpdates || messageUpdates.length === 0) return;
+            for (const { key, update } of messageUpdates) {
+                if (update && update.message && !key.fromMe) {
+                    addLog(`[Tenant ${tenantId}] 🔓 Gecikmeli Şifresi Çözülen Mesaj: ${key.remoteJid}`);
+                    await handleIncomingMessage({ key, message: update.message });
+                }
+            }
+        } catch (e) {
+            addLog(`[Tenant ${tenantId}] messages.update hatası: ${e.message}`);
         }
     });
 
@@ -484,21 +512,33 @@ app.post('/send', async (req, res) => {
             return res.status(503).json({ success: false, error: 'Bu dukkanin WhatsApp oturumu bagli degil' });
         }
 
-        let cleanPhone = to.toString().replace(/[^0-9]/g, '');
-        if (cleanPhone.startsWith('0')) {
-            cleanPhone = '90' + cleanPhone.substring(1);
-        } else if (!cleanPhone.startsWith('90') && cleanPhone.length === 10) {
-            cleanPhone = '90' + cleanPhone;
+        let targetJid;
+        const toStr = to.toString().trim();
+        if (toStr.includes('@')) {
+            targetJid = toStr;
+        } else if (toStr.length >= 14 && !toStr.startsWith('90')) {
+            // WhatsApp LID formatı (örn: 190151154237634)
+            targetJid = `${toStr}@lid`;
+        } else {
+            let cleanPhone = toStr.replace(/[^0-9]/g, '');
+            if (cleanPhone.startsWith('0')) {
+                cleanPhone = '90' + cleanPhone.substring(1);
+            } else if (!cleanPhone.startsWith('90') && cleanPhone.length === 10) {
+                cleanPhone = '90' + cleanPhone;
+            }
+            targetJid = `${cleanPhone}@s.whatsapp.net`;
         }
 
-        const jid = `${cleanPhone}@s.whatsapp.net`;
-        const sent = await sess.sock.sendMessage(jid, { text: message });
+        const sent = await sess.sock.sendMessage(targetJid, { text: message });
         if (sent?.key && sent?.message) {
             storeMessage(sent.key, sent.message);
         }
 
-        addLog(`[Tenant ${tenantId}] 📤 Giden Mesaj: ${cleanPhone} -> "${message.substring(0, 35)}..."`);
-        res.json({ success: true, to: cleanPhone, status: 'sent' });
+        const sessionDir = path.join(__dirname, 'sessions', `tenant_${tenantId}`);
+        scheduleBackupToDb(tenantId, sessionDir, 5000);
+
+        addLog(`[Tenant ${tenantId}] 📤 Giden Mesaj: ${targetJid} -> "${message.substring(0, 35)}..."`);
+        res.json({ success: true, to: targetJid, status: 'sent' });
     } catch (err) {
         addLog(`[Tenant ${tenantId}] ⚠️ Mesaj gönderme hatası: ${err.message}`);
         res.status(500).json({ success: false, error: err.message });
