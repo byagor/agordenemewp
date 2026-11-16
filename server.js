@@ -5,6 +5,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
+const NodeCache = require('node-cache');
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -35,24 +36,14 @@ function addLog(msg) {
     if (recentLogs.length > 100) recentLogs.pop();
 }
 
-// Mesaj Tekrar Deneme Sayacı Önbelleği (WhatsApp'ın "Mesaj bekleniyor..." hatasını çözer)
-const retryMap = new Map();
-const msgRetryCounterCache = {
-    get: (key) => retryMap.get(key),
-    set: (key, value) => { retryMap.set(key, value); return true; },
-    del: (key) => retryMap.delete(key),
-    flushAll: () => retryMap.clear()
-};
+// Mesaj Tekrar Deneme Sayacı Önbelleği (WhatsApp'ın "Mesaj bekleniyor..." hatasını çözen resmi NodeCache deposu)
+const msgRetryCounterCache = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
 
 // Son gönderilen ve alınan mesajları hafızada tutan depo (WhatsApp retry/rekey istediğinde sunar)
-const messageStore = new Map();
+const messageStore = new NodeCache({ stdTTL: 86400, maxKeys: 4000, useClones: false });
 function storeMessage(key, message) {
     if (!key || !key.id) return;
     messageStore.set(key.id, message);
-    if (messageStore.size > 2000) {
-        const firstKey = messageStore.keys().next().value;
-        messageStore.delete(firstKey);
-    }
 }
 
 // Tenant Oturumları Deposu
@@ -196,21 +187,15 @@ async function initSession(tenantId) {
         },
         logger,
         printQRInTerminal: false,
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: true,
-        shouldSyncHistoryMessage: (msg) => {
-            return msg.syncType === proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP ||
-                   msg.syncType === proto.HistorySync.HistorySyncType.PUSH_NAME ||
-                   msg.syncType === proto.HistorySync.HistorySyncType.RECENT;
-        },
+        browser: Browsers.windows('Desktop'),
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
         getMessage: async (key) => {
-            if (messageStore.has(key.id)) {
-                return messageStore.get(key.id);
-            }
-            return {
-                conversation: 'BerberRandevu Bot'
-            };
+            if (!key || !key.id) return undefined;
+            const msg = messageStore.get(key.id);
+            return msg || undefined;
         }
     });
 
@@ -535,6 +520,13 @@ app.post('/send', async (req, res) => {
             targetJid = `${cleanPhone}@s.whatsapp.net`;
         }
 
+        // İnsansı yazıyor bildirimi (WhatsApp presence typing - spam koruması ve anahtar senkronizasyonu)
+        try {
+            await sess.sock.sendPresenceUpdate('composing', targetJid);
+            await new Promise(r => setTimeout(r, 800));
+            await sess.sock.sendPresenceUpdate('paused', targetJid);
+        } catch (e) {}
+
         const sent = await sess.sock.sendMessage(targetJid, { text: message });
         if (sent?.key && sent?.message) {
             storeMessage(sent.key, sent.message);
@@ -551,14 +543,16 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// 7. Çıkış Yap / Bağlantıyı Kes
-app.post('/disconnect', async (req, res) => {
+// 7. Çıkış Yap / Oturumu Temizle (GET ve POST)
+app.all(['/disconnect', '/reset'], async (req, res) => {
     try {
-        const tenantId = req.body.tenant || req.query.tenant || '5';
+        const tenantId = req.body?.tenant || req.query?.tenant || '5';
         const sess = sessions[tenantId];
 
         if (sess && sess.sock) {
-            await sess.sock.logout();
+            try {
+                await sess.sock.logout();
+            } catch (e) {}
         }
 
         const sessionDir = path.join(__dirname, 'sessions', `tenant_${tenantId}`);
